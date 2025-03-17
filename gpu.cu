@@ -6,6 +6,8 @@
 #include <thrust/scan.h>
 #include <thrust/device_ptr.h>
 
+#define NUM_THREADS 256
+
 // Adjusted global variables
 int thread_count, block_count;
 struct ParticleWrapper;
@@ -135,7 +137,7 @@ struct InitializeWrappers {
 
 // Simulation initialization
 void init_simulation(particle_t* host_parts, int num_particles, double sim_size) {
-    thread_count = 32;
+    thread_count = 256;
     block_count = (num_particles + thread_count - 1) / thread_count;
     host_grid_width = static_cast<int>(sim_size / grid_resolution) + 1;
 
