@@ -1,129 +1,87 @@
 #include "common.h"
 #include <cuda.h>
-#include <thrust/device_vector.h>
+#include <math.h>
 #include <thrust/scan.h>
-#include <thrust/for_each.h>
-#include <thrust/execution_policy.h>
+#include <thrust/device_ptr.h>
 
-__constant__ particle_t* d_particles;
-__constant__ int d_num_particles;
-__constant__ double d_sim_size;
-__constant__ int d_grid_width;
-__constant__ double d_grid_step;
+#define NUM_THREADS 256
 
-struct ParticleData {
-    double x, y, vx, vy, ax, ay;
+struct CellData;
+__constant__ particle_t* device_particles;
+__constant__ int total_particles;
+__constant__ double sim_domain;
+int host_grid_size;
+__constant__ int device_grid_size;
+double host_grid_step = cutoff * 1.00001;
+__constant__ double device_grid_step;
+CellData** host_grid;
+__constant__ CellData** device_grid;
+int* host_grid_offsets;
+__constant__ int* device_grid_offsets;
+CellData* host_particle_cells;
+__constant__ CellData* device_particle_cells;
+
+struct CellData {
+    particle_t* particle;
+    int grid_index;
+    int particle_index;
 };
 
-struct GridCell {
-    int start_idx;
-    int count;
-};
-
-__device__ inline void compute_interaction(particle_t &a, particle_t &b) {
-    double dx = b.x - a.x;
-    double dy = b.y - a.y;
+__device__ void compute_interaction(particle_t &p1, particle_t &p2) {
+    double dx = p2.x - p1.x;
+    double dy = p2.y - p1.y;
     double r2 = dx * dx + dy * dy;
-
-    if (r2 >= cutoff * cutoff) return;
-
-    r2 = fmax(r2, min_r * min_r);
-    double force_mag = (1.0 - cutoff / sqrt(r2)) / (r2 * mass);
-
-    a.ax += force_mag * dx;
-    a.ay += force_mag * dy;
+    if (r2 > cutoff * cutoff) return;
+    r2 = (r2 > min_r * min_r) ? r2 : min_r * min_r;
+    double force_coeff = (1 - cutoff * rsqrt(r2)) / r2 / mass;
+    p1.ax += force_coeff * dx;
+    p1.ay += force_coeff * dy;
 }
 
-struct AssignGrid {
-    int grid_dim;
-    double grid_step;
-    int* grid_counts;
-
-    AssignGrid(int grid_size, double step, int* counts)
-        : grid_dim(grid_size), grid_step(step), grid_counts(counts) {}
-
-    __device__ void operator()(particle_t& p) {
-        int gx = min(max(int(p.x / grid_step), 0), grid_dim - 1);
-        int gy = min(max(int(p.y / grid_step), 0), grid_dim - 1);
-        int grid_idx = gy * grid_dim + gx;
-        atomicAdd(&grid_counts[grid_idx], 1);
-    }
-};
-
-void init_simulation(particle_t* h_particles, int num_particles, double sim_size) {
-    int grid_size = int(sim_size / (cutoff * 1.1)) + 1;
-    int total_cells = grid_size * grid_size;
-
-    cudaMemcpyToSymbol(d_particles, &h_particles, sizeof(particle_t*));
-    cudaMemcpyToSymbol(d_num_particles, &num_particles, sizeof(int));
-    cudaMemcpyToSymbol(d_sim_size, &sim_size, sizeof(double));
-    cudaMemcpyToSymbol(d_grid_width, &grid_size, sizeof(int));
-
-    thrust::device_vector<int> grid_counts(total_cells, 0);
-    thrust::for_each(thrust::device, h_particles, h_particles + num_particles, 
-                     AssignGrid(grid_size, cutoff * 1.1, thrust::raw_pointer_cast(grid_counts.data())));
-
-    thrust::inclusive_scan(thrust::device, grid_counts.begin(), grid_counts.end(), grid_counts.begin());
-}
-
-__global__ void compute_forces_gpu(particle_t* particles, int* grid_counts, int grid_width) {
+__global__ void compute_forces_kernel() {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= d_num_particles) return;
-
-    particle_t& p = particles[idx];
-    int gx = min(max(int(p.x / d_grid_step), 0), grid_width - 1);
-    int gy = min(max(int(p.y / d_grid_step), 0), grid_width - 1);
-    int grid_idx = gy * grid_width + gx;
-
-    for (int dy = -1; dy <= 1; ++dy) {
-        for (int dx = -1; dx <= 1; ++dx) {
-            int neighbor_idx = grid_idx + dy * grid_width + dx;
-            if (neighbor_idx < 0 || neighbor_idx >= grid_width * grid_width) continue;
-            int start = (neighbor_idx == 0) ? 0 : grid_counts[neighbor_idx - 1];
-            int end = grid_counts[neighbor_idx];
-
-            for (int i = start; i < end; ++i) {
-                compute_interaction(p, particles[i]);
+    if (idx >= total_particles) return;
+    CellData* cell = device_grid[idx];
+    particle_t& p = *cell->particle;
+    int grid_idx = cell->grid_index;
+    for (int offset = -device_grid_size - 2; offset <= device_grid_size + 2; offset += device_grid_size + 2) {
+        for (int j = -1; j <= 1; ++j) {
+            int neighbor_idx = grid_idx + offset + j;
+            for (int i = device_grid_offsets[neighbor_idx]; i < device_grid_offsets[neighbor_idx + 1]; ++i) {
+                compute_interaction(p, *device_grid[i]->particle);
             }
         }
     }
 }
 
-__global__ void move_gpu(particle_t* particles) {
+__global__ void update_positions_kernel() {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= d_num_particles) return;
-
-    particle_t& p = particles[idx];
-
-    p.vx += p.ax * dt;
-    p.vy += p.ay * dt;
-    p.x += p.vx * dt;
-    p.y += p.vy * dt;
-
-    if (p.x < 0 || p.x > d_sim_size) {
-        p.x = (p.x < 0) ? -p.x : 2 * d_sim_size - p.x;
-        p.vx *= -1;
-    }
-    if (p.y < 0 || p.y > d_sim_size) {
-        p.y = (p.y < 0) ? -p.y : 2 * d_sim_size - p.y;
-        p.vy *= -1;
-    }
-
-    p.ax = p.ay = 0;
+    if (idx >= total_particles) return;
+    particle_t* p = device_grid[idx]->particle;
+    p->vx += p->ax * dt;
+    p->vy += p->ay * dt;
+    p->x += p->vx * dt;
+    p->y += p->vy * dt;
+    p->ax = p->ay = 0;
 }
 
-void simulate_one_step(particle_t* h_particles, int num_particles, double sim_size) {
-    int grid_size = int(sim_size / (cutoff * 1.1)) + 1;
-    int total_cells = grid_size * grid_size;
+void init_simulation(particle_t* host_particles, int num_particles, double domain_size) {
+    host_grid_size = static_cast<int>(domain_size / host_grid_step) + 1;
+    cudaMalloc(&host_grid, num_particles * sizeof(CellData*));
+    cudaMalloc(&host_grid_offsets, (host_grid_size + 2) * (host_grid_size + 2) * sizeof(int));
+    cudaMalloc(&host_particle_cells, num_particles * sizeof(CellData));
+    cudaMemcpyToSymbol(device_particles, &host_particles, sizeof(particle_t*));
+    cudaMemcpyToSymbol(total_particles, &num_particles, sizeof(int));
+    cudaMemcpyToSymbol(sim_domain, &domain_size, sizeof(double));
+    cudaMemcpyToSymbol(device_grid, &host_grid, sizeof(CellData**));
+    cudaMemcpyToSymbol(device_grid_offsets, &host_grid_offsets, sizeof(int*));
+    cudaMemcpyToSymbol(device_particle_cells, &host_particle_cells, sizeof(CellData*));
+    cudaMemcpyToSymbol(device_grid_size, &host_grid_size, sizeof(int));
+    cudaMemcpyToSymbol(device_grid_step, &host_grid_step, sizeof(double));
+}
 
-    thrust::device_vector<int> grid_counts(total_cells, 0);
-    thrust::for_each(thrust::device, h_particles, h_particles + num_particles, 
-                     AssignGrid(grid_size, cutoff * 1.1, thrust::raw_pointer_cast(grid_counts.data())));
-    thrust::inclusive_scan(thrust::device, grid_counts.begin(), grid_counts.end(), grid_counts.begin());
-
-    int threads_per_block = 128;
-    int num_blocks = (num_particles + threads_per_block - 1) / threads_per_block;
-    
-    compute_forces_gpu<<<num_blocks, threads_per_block>>>(h_particles, thrust::raw_pointer_cast(grid_counts.data()), grid_size);
-    move_gpu<<<num_blocks, threads_per_block>>>(h_particles);
+void simulate_one_step(particle_t* parts, int num_parts, double size) {
+    cudaMemset(host_grid_offsets, 0, (host_grid_size + 2) * (host_grid_size + 2) * sizeof(int));
+    compute_forces_kernel<<<(num_parts + 31) / 32, 32>>>();
+    update_positions_kernel<<<(num_parts + 31) / 32, 32>>>();
 }
