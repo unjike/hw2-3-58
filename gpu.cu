@@ -27,6 +27,35 @@ struct CellData {
     int particle_index;
 };
 
+__global__ void assign_particles_to_grid(particle_t* particles, CellData* particle_cells, int* grid_offsets, int num_particles, int grid_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_particles) return;  // Ensure we do not access out-of-bounds memory
+
+    particle_t& p = particles[idx];
+
+    // Compute the grid cell coordinates based on the particle's position
+    int grid_x = static_cast<int>(p.x / device_grid_step);
+    int grid_y = static_cast<int>(p.y / device_grid_step);
+    int grid_idx = grid_y * grid_size + grid_x;
+
+    // Ensure the index is within valid bounds
+    if (grid_idx < 0 || grid_idx >= grid_size * grid_size) return;
+
+    // Use atomicAdd to safely increment and get the correct position for this particle
+    int pos = atomicAdd(&grid_offsets[grid_idx], 1);
+
+    if (pos < num_particles) {
+        particle_cells[pos].particle = &p;
+        particle_cells[pos].grid_index = grid_idx;
+        particle_cells[pos].particle_index = idx;
+    }
+
+    // Store the particle's information in the CellData structure
+    particle_cells[pos].particle = &p;
+    particle_cells[pos].grid_index = grid_idx;
+    particle_cells[pos].particle_index = idx;
+}
+
 __device__ void compute_interaction(particle_t &p1, particle_t &p2) {
     double dx = p2.x - p1.x;
     double dy = p2.y - p1.y;
@@ -68,7 +97,8 @@ __global__ void update_positions_kernel() {
 void init_simulation(particle_t* host_particles, int num_particles, double domain_size) {
     host_grid_size = static_cast<int>(domain_size / host_grid_step) + 1;
     cudaMalloc(&host_grid, num_particles * sizeof(CellData*));
-    cudaMalloc(&host_grid_offsets, (host_grid_size + 2) * (host_grid_size + 2) * sizeof(int));
+    // cudaMalloc(&host_grid_offsets, (host_grid_size + 2) * (host_grid_size + 2) * sizeof(int));
+    cudaMalloc(&host_grid_offsets, (host_grid_size * host_grid_size) * sizeof(int));
     cudaMalloc(&host_particle_cells, num_particles * sizeof(CellData));
     cudaMemcpyToSymbol(device_particles, &host_particles, sizeof(particle_t*));
     cudaMemcpyToSymbol(total_particles, &num_particles, sizeof(int));
@@ -80,8 +110,35 @@ void init_simulation(particle_t* host_particles, int num_particles, double domai
     cudaMemcpyToSymbol(device_grid_step, &host_grid_step, sizeof(double));
 }
 
+
+// void simulate_one_step(particle_t* parts, int num_parts, double size) {
+//     cudaMemset(host_grid_offsets, 0, (host_grid_size + 2) * (host_grid_size + 2) * sizeof(int));
+
+//     // Step 1: Assign particles to grid cells safely
+//     assign_particles_to_grid<<<(num_parts + NUM_THREADS - 1) / NUM_THREADS, NUM_THREADS>>>(
+//         parts, host_particle_cells, host_grid_offsets, num_parts, host_grid_size
+//     );
+
+//     // Step 2: Compute forces using the updated grid structure
+//     compute_forces_kernel<<<(num_parts + NUM_THREADS - 1) / NUM_THREADS, NUM_THREADS>>>();
+
+//     // Step 3: Update positions of particles
+//     update_positions_kernel<<<(num_parts + NUM_THREADS - 1) / NUM_THREADS, NUM_THREADS>>>();
+// }
 void simulate_one_step(particle_t* parts, int num_parts, double size) {
     cudaMemset(host_grid_offsets, 0, (host_grid_size + 2) * (host_grid_size + 2) * sizeof(int));
-    compute_forces_kernel<<<(num_parts + 31) / 32, 32>>>();
-    update_positions_kernel<<<(num_parts + 31) / 32, 32>>>();
+
+    // Step 1: Assign particles to grid cells safely
+    assign_particles_to_grid<<<(num_parts + NUM_THREADS - 1) / NUM_THREADS, NUM_THREADS>>>(
+        parts, host_particle_cells, host_grid_offsets, num_parts, host_grid_size
+    );
+    cudaDeviceSynchronize(); // Ensure all particles are correctly assigned before force computation
+
+    // Step 2: Compute forces using the updated grid structure
+    compute_forces_kernel<<<(num_parts + NUM_THREADS - 1) / NUM_THREADS, NUM_THREADS>>>();
+    cudaDeviceSynchronize(); // Ensure all forces are computed before updating positions
+
+    // Step 3: Update positions of particles
+    update_positions_kernel<<<(num_parts + NUM_THREADS - 1) / NUM_THREADS, NUM_THREADS>>>();
+    cudaDeviceSynchronize(); // Ensure all positions are updated before the next simulation step
 }
