@@ -110,21 +110,6 @@ void init_simulation(particle_t* host_particles, int num_particles, double domai
     cudaMemcpyToSymbol(device_grid_step, &host_grid_step, sizeof(double));
 }
 
-
-// void simulate_one_step(particle_t* parts, int num_parts, double size) {
-//     cudaMemset(host_grid_offsets, 0, (host_grid_size + 2) * (host_grid_size + 2) * sizeof(int));
-
-//     // Step 1: Assign particles to grid cells safely
-//     assign_particles_to_grid<<<(num_parts + NUM_THREADS - 1) / NUM_THREADS, NUM_THREADS>>>(
-//         parts, host_particle_cells, host_grid_offsets, num_parts, host_grid_size
-//     );
-
-//     // Step 2: Compute forces using the updated grid structure
-//     compute_forces_kernel<<<(num_parts + NUM_THREADS - 1) / NUM_THREADS, NUM_THREADS>>>();
-
-//     // Step 3: Update positions of particles
-//     update_positions_kernel<<<(num_parts + NUM_THREADS - 1) / NUM_THREADS, NUM_THREADS>>>();
-// }
 void simulate_one_step(particle_t* parts, int num_parts, double size) {
     cudaMemset(host_grid_offsets, 0, (host_grid_size + 2) * (host_grid_size + 2) * sizeof(int));
 
